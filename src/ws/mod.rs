@@ -8,20 +8,32 @@ mod tests;
 pub use error::*;
 pub use model::*;
 
+use futures_util::{sink, Sink};
+use futures_util::stream::{FuturesUnordered, SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use hmac_sha256::HMAC;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::Sender;
 use tokio::time; // 1.3.0
 use tokio::time::Interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 pub struct Ws {
-    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    stream: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    write_rx: Sender<Message>,
+    sink: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     buf: VecDeque<Data>,
     ping_timer: Interval,
+    pings: FuturesUnordered<
+        sink::Send<
+            'static,
+            SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+            Message,
+        >,
+    >,
 }
 
 impl Ws {
@@ -34,7 +46,9 @@ impl Ws {
         secret: String,
         subaccount: Option<String>,
     ) -> Result<Self> {
-        let (mut stream, _) = connect_async(endpoint).await?;
+        let (stream, _) = connect_async(endpoint).await?;
+
+        let (mut sink, stream) = stream.split();
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -44,25 +58,26 @@ impl Ws {
         let sign = HMAC::mac(sign_payload.as_bytes(), secret.as_bytes());
         let sign = hex::encode(sign);
 
-        stream
-            .send(Message::Text(
-                json!({
-                    "op": "login",
-                    "args": {
-                        "key": key,
-                        "sign": sign,
-                        "time": timestamp as u64,
-                        "subaccount": subaccount,
-                    }
-                })
-                .to_string(),
-            ))
-            .await?;
+        sink.send(Message::Text(
+            json!({
+                "op": "login",
+                "args": {
+                    "key": key,
+                    "sign": sign,
+                    "time": timestamp as u64,
+                    "subaccount": subaccount,
+                }
+            })
+            .to_string(),
+        ))
+        .await?;
 
         Ok(Self {
             stream,
+            sink,
             buf: VecDeque::new(),
             ping_timer: time::interval(Duration::from_secs(15)),
+            pings: FuturesUnordered::new(),
         })
     }
 
@@ -79,7 +94,7 @@ impl Ws {
     }
 
     async fn ping(&mut self) -> Result<()> {
-        self.stream
+        self.sink
             .send(Message::Text(
                 json!({
                     "op": "ping",
@@ -100,7 +115,7 @@ impl Ws {
                 Channel::Fills => ("fills", "".to_string()),
             };
 
-            self.stream
+            self.sink
                 .send(Message::Text(
                     json!({
                         "op": "subscribe",
@@ -127,12 +142,37 @@ impl Ws {
         loop {
             tokio::select! {
                 _ = self.ping_timer.tick() => {
-                    self.ping().await?;
+                    // self.ping() has type Future<Output=Result<()>>
+                    // self.pings.push(self.ping().boxed());
+                    // self.ping().await?;
+
+                    // Send<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>, Message>
+                    // NOTE Unsure how to use this future
+                    let ping = self.sink
+                        .send(Message::Text(
+                            json!({
+                                "op": "ping",
+                            })
+                            .to_string(),
+                        ));
+
+                    // FIXME: Uncomment to resolve compiler error
+                    self.pings.push(ping);
+
+                    // NOTE No into_split() function available, can't clone or move
+                    // FIXME: This doesn't work either
+                    tokio::spawn(async move {
+                        ping.await?;
+
+                        Ok::<_, Error>(())
+                    });
+
+                    // TODO select on the ping futures
                 },
                 Some(msg) = self.stream.next() => {
                     let msg = msg?;
                     if let Message::Text(text) = msg {
-                        // println!("{}", text); // Uncomment for debugging
+                        // println!("Stream: {}", text); // Uncomment for debugging
                         let response: Response = serde_json::from_str(&text)?;
 
                         // Don't return Pong responses
@@ -143,6 +183,14 @@ impl Ws {
                         return Ok(response)
                     }
                 },
+                // Some(msg) = self.sink => {
+                //     let msg = msg?;
+                //     if let Message::Text(text) = msg {
+                //         println!("Sink: {}", text); // Uncomment for debugging
+                //
+                //         // TODO do I need to do something with this
+                //     }
+                // }
             }
         }
     }
